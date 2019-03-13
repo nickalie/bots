@@ -1,31 +1,53 @@
-# msbot
-Golang Implementation of Microsoft BotFramework
+# Golang Polyglot Bot Framework
+
+Supported platforms:
+* [Microsoft Bot Framework](https://dev.botframework.com):
+  * [Telegram](https://telegram.org/)
+  * [Skype](https://www.skype.com)
+  * [Facebook Messenger](https://www.messenger.com/)
+  * [Kik](https://www.kik.com/)
+  * [Line](https://line.me)
+  * .. and others supported by [Microsoft Bot Framework](https://dev.botframework.com)
+* [Viber](https://www.viber.com)   
 
 ```
-bot := msbot.NewBot(&msbot.BotSettings{
+router := mux.NewRouter()
+vBot, err := bots.NewViberBot(&bots.ViberBotConfig{
+		Token:      "viber-bot-token,
+		WebHookURL: "https://your-domain.com/messages/viber",
+})
+
+if err != nil {
+    log.Fatal(err)
+}
+	
+router.Handle("/messages/viber", vBot)	
+	
+msBot := msbot.NewBot(&msbot.BotSettings{
   AppId:       "app-id",
   AppPassword: "app-password",
- })
-http.Handle("/api/messages", bot)
-http.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir("."))))
-go http.ListenAndServe(":3980", nil)
+  Channels:    []string{bots.ChannelWebChat, bots.ChannelTelegram, bots.ChannelLine, bots.ChannelSkype, bots.ChannelKik, bots.ChannelFacebook},
+  ValidateRequests: true,
+})
 
-updates := bot.GetUpdatesChannel()
+router.Handle("/messages/ms/", msBot)
+go http.ListenAndServe(":80", router)
 
-for activity := range updates {
+multiBot = bots.NewMultiBot(vBot, msBot)
+
+activities, err := multiBot.GetUpdatesChannel()
+
+if err != nil {
+    log.Fatal(err)
+}
+
+for activity := range activities {
   if activity.Type != "message" {
     continue
   }
   
-  response := msbot.Activity{}
-  response.Type = "message"
-  response.From = activity.Recipient
-  response.Recipient = activity.From
-  response.Text = "You said: " + activity.Text
-  response.ReplyToId = activity.Id
-  response.Conversation = activity.Conversation
-  response.ServiceUrl = activity.ServiceUrl
-  identity, err := bot.Send(&response)
+  response := activity.Response("You said: " + activity.Text)
+  identity, err := bot.Send(response)
   fmt.Printf("bot.Send: %v, %v\n", identity, err)
 }
 ```

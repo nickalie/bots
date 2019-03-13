@@ -1,24 +1,22 @@
-package msbot
+package bots
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
-	"github.com/nickalie/msbot/utils"
+	"github.com/nickalie/bots/utils"
 	"github.com/parnurzeal/gorequest"
 )
 
 const UserAgent = "Microsoft-BotFramework/3.1 (MSBot Golang)"
 
-type BotEndpoint struct {
+type MSBotEndpoint struct {
 	RefreshEndpoint            string
 	RefreshScope               string
 	BotConnectorOpenIdMetadata string
@@ -30,17 +28,19 @@ type BotEndpoint struct {
 	StateEndpoint              string
 }
 
-type BotSettings struct {
-	AppId          string
-	AppPassword    string
-	GzipData       bool
-	Endpoint       *BotEndpoint
-	StateEndpoint  string
-	OpenIdMetadata string
+type MSBotSettings struct {
+	AppId            string
+	AppPassword      string
+	GzipData         bool
+	Endpoint         *MSBotEndpoint
+	StateEndpoint    string
+	OpenIdMetadata   string
+	ValidateRequests bool
+	Channels         []string
 }
 
-type Bot struct {
-	settings                   *BotSettings
+type MSBot struct {
+	settings                   *MSBotSettings
 	botConnectorOpenIdMetadata *OpenIdMetadata
 	emulatorOpenIdMetadata     *OpenIdMetadata
 	accessToken                string
@@ -48,9 +48,9 @@ type Bot struct {
 	updatesChannel             chan *Activity
 }
 
-func NewBot(settings *BotSettings) *Bot {
+func NewMSBot(settings *MSBotSettings) *MSBot {
 	if settings == nil {
-		settings = &BotSettings{}
+		settings = &MSBotSettings{}
 	}
 
 	if settings.Endpoint == nil {
@@ -67,7 +67,7 @@ func NewBot(settings *BotSettings) *Bot {
 			stateEndpoint = "https://state.botframework.com"
 		}
 
-		settings.Endpoint = &BotEndpoint{
+		settings.Endpoint = &MSBotEndpoint{
 			RefreshEndpoint:            "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
 			RefreshScope:               "https://api.botframework.com/.default",
 			BotConnectorOpenIdMetadata: openIdMetadata,
@@ -83,7 +83,7 @@ func NewBot(settings *BotSettings) *Bot {
 		}
 	}
 
-	return &Bot{
+	return &MSBot{
 		settings:                   settings,
 		botConnectorOpenIdMetadata: NewOpenIdMetadata(settings.Endpoint.BotConnectorOpenIdMetadata),
 		emulatorOpenIdMetadata:     NewOpenIdMetadata(settings.Endpoint.EmulatorOpenIdMetadata),
@@ -91,68 +91,58 @@ func NewBot(settings *BotSettings) *Bot {
 	}
 }
 
-func (b *Bot) GetFile(url string) (*http.Response, error) {
-	r, err := http.NewRequest(http.MethodGet, url, nil)
-
-	if err != nil {
-		return nil, err
-	}
-
-	token, err := b.getAccessToken()
-
-	if err != nil {
-		return nil, err
-	}
-
-	r.Header.Set("Authorization", "Bearer "+token)
-	return http.DefaultClient.Do(r)
+func (b *MSBot) GetFile(attachment *Attachment, activity *Activity) (*http.Response, error) {
+	return b.authenticatedRequest(gorequest.New().Get(attachment.ContentUrl), false)
 }
 
-func (b *Bot) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	b.verifyBotFramework(w, r)
-}
+func (b *MSBot) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
-func (b *Bot) verifyBotFramework(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, "unsupported method: "+r.Method)
 		return
 	}
 
 	defer r.Body.Close()
-	var body bytes.Buffer
-	io.Copy(&body, r.Body)
 	incoming := Activity{}
-	json.Unmarshal(body.Bytes(), &incoming)
-	isEmulator := incoming.ChannelId == "emulator"
-	var token string
-	authHeaderValue := r.Header.Get("authorization")
+	decoder := json.NewDecoder(r.Body)
+	decoder.Decode(&incoming)
 
-	if authHeaderValue == "" {
-		authHeaderValue = r.Header.Get("Authorization")
-	}
+	if b.settings.ValidateRequests {
+		isEmulator := incoming.ChannelId == "emulator"
+		var token string
+		authHeaderValue := r.Header.Get("authorization")
 
-	if authHeaderValue != "" {
-		auth := strings.Split(strings.Trim(authHeaderValue, " "), " ")
-
-		if len(auth) == 2 && strings.ToLower(auth[0]) == "bearer" {
-			token = auth[1]
+		if authHeaderValue == "" {
+			authHeaderValue = r.Header.Get("Authorization")
 		}
-	}
 
-	if token != "" {
-		if !b.validateToken(token, &incoming, isEmulator, w) {
+		if authHeaderValue != "" {
+			auth := strings.Split(strings.Trim(authHeaderValue, " "), " ")
+
+			if len(auth) == 2 && strings.ToLower(auth[0]) == "bearer" {
+				token = auth[1]
+			}
+		}
+
+		if token != "" {
+			if !b.validateToken(token, &incoming, isEmulator, w) {
+				return
+			}
+		} else if isEmulator && b.settings.AppId != "" && b.settings.AppPassword != "" {
+			errorResponse(w, "invalid token")
 			return
 		}
-	} else if isEmulator && b.settings.AppId != "" && b.settings.AppPassword != "" {
-		errorResponse(w, "invalid token")
-		return
 	}
 
 	b.updatesChannel <- &incoming
 	w.WriteHeader(http.StatusOK)
 }
 
-func (b *Bot) validateToken(token string, incoming *Activity, isEmulator bool, w http.ResponseWriter) bool {
+func (b *MSBot) validateToken(token string, incoming *Activity, isEmulator bool, w http.ResponseWriter) bool {
 	var openIDMetadata *OpenIdMetadata
 
 	if isEmulator {
@@ -229,8 +219,9 @@ func errorResponse(w http.ResponseWriter, message string) {
 	w.Write([]byte(message))
 }
 
-func (b *Bot) Send(activity *Activity) (*Identification, error) {
-	path := "/v3/conversations/" + url.QueryEscape(activity.Conversation.Id) + "/activities"
+func (b *MSBot) Send(activity *Activity) (*Identification, error) {
+	activity = fixActivity(activity)
+	path := "v3/conversations/" + url.QueryEscape(activity.Conversation.Id) + "/activities"
 
 	if activity.ReplyToId != "" {
 		path += "/" + url.QueryEscape(activity.ReplyToId)
@@ -250,7 +241,8 @@ func (b *Bot) Send(activity *Activity) (*Identification, error) {
 	return result, err
 }
 
-func (b *Bot) Update(activity *Activity) (*Identification, error) {
+func (b *MSBot) Update(activity *Activity) (*Identification, error) {
+	activity = fixActivity(activity)
 	path := "/v3/conversations/" + url.QueryEscape(activity.Conversation.Id) + "/activities"
 
 	if activity.Id != "" {
@@ -271,7 +263,7 @@ func (b *Bot) Update(activity *Activity) (*Identification, error) {
 	return result, err
 }
 
-func (b *Bot) Delete(activity *Activity) error {
+func (b *MSBot) Delete(activity *Activity) error {
 	path := "/v3/conversations/" + url.QueryEscape(activity.Conversation.Id) + "/activities"
 
 	if activity.Id != "" {
@@ -283,7 +275,7 @@ func (b *Bot) Delete(activity *Activity) error {
 	return err
 }
 
-func (b *Bot) authenticatedRequest(request *gorequest.SuperAgent, refresh bool) (*http.Response, error) {
+func (b *MSBot) authenticatedRequest(request *gorequest.SuperAgent, refresh bool) (*http.Response, error) {
 	if refresh {
 		b.accessToken = ""
 	}
@@ -313,7 +305,7 @@ func (b *Bot) authenticatedRequest(request *gorequest.SuperAgent, refresh bool) 
 	return resp, errors.New(fmt.Sprintf("authenticatedRequest failed: %s %d", body, resp.StatusCode))
 }
 
-func (b *Bot) addAccessToken(request *gorequest.SuperAgent) error {
+func (b *MSBot) addAccessToken(request *gorequest.SuperAgent) error {
 	token, err := b.getAccessToken()
 
 	if err != nil {
@@ -324,22 +316,22 @@ func (b *Bot) addAccessToken(request *gorequest.SuperAgent) error {
 	return nil
 }
 
-func (b *Bot) addUserAgent(request *gorequest.SuperAgent) {
+func (b *MSBot) addUserAgent(request *gorequest.SuperAgent) {
 	request.Set("User-Agent", UserAgent)
 }
 
-func (b *Bot) tokenExpired() bool {
+func (b *MSBot) tokenExpired() bool {
 	return time.Now().Unix() >= b.accessTokenExpires
 }
 
-func (b *Bot) tokenHalfWayExpired() bool {
+func (b *MSBot) tokenHalfWayExpired() bool {
 	var secondsToHalfWayExpire int64 = 1800
 	var secondsToExpire int64 = 300
 	var timeToExpiration = (b.accessTokenExpires - time.Now().Unix()) / 1000
 	return timeToExpiration < secondsToHalfWayExpire && timeToExpiration > secondsToExpire
 }
 
-func (b *Bot) getAccessToken() (string, error) {
+func (b *MSBot) getAccessToken() (string, error) {
 	if b.accessToken == "" || b.tokenExpired() {
 		return b.refreshAccessToken()
 	} else if b.tokenHalfWayExpired() {
@@ -356,7 +348,7 @@ func (b *Bot) getAccessToken() (string, error) {
 	}
 }
 
-func (b *Bot) refreshAccessToken() (string, error) {
+func (b *MSBot) refreshAccessToken() (string, error) {
 	r := gorequest.New().Post(b.settings.Endpoint.RefreshEndpoint)
 	r.Type("multipart")
 	r.Send(map[string]string{
@@ -383,6 +375,47 @@ func (b *Bot) refreshAccessToken() (string, error) {
 	return b.accessToken, nil
 }
 
-func (b *Bot) GetUpdatesChannel() <-chan *Activity {
-	return b.updatesChannel
+func (b *MSBot) GetUpdatesChannel() (<-chan *Activity, error) {
+	return b.updatesChannel, nil
+}
+
+func (b *MSBot) GetChannels() []string {
+	return b.settings.Channels
+}
+
+func fixActivity(activity *Activity) *Activity {
+	if activity.ChannelId == ChannelLine || activity.ChannelId == "kik" {
+		if len(activity.Attachments) > 0 {
+			newAttachments := make([]*Attachment, 0)
+			for _, a := range activity.Attachments {
+				if a.ContentType == TypeHeroCard {
+					if card, ok := a.Content.(*HeroCard); ok {
+						if len(card.Buttons) > 0 {
+							newButtons := make([]*CardAction, 0)
+							for _, button := range card.Buttons {
+								if button.Type == TypeOpenUrl {
+									activity.Text += "<br/><br/>" + button.Title + "\n" + button.Value
+								} else {
+									newButtons = append(newButtons, button)
+								}
+							}
+							card.Buttons = newButtons
+						}
+					}
+				}
+
+				newAttachments = append(newAttachments, a)
+			}
+
+			activity.Attachments = newAttachments
+		}
+	}
+
+	if activity.ChannelId == "kik" {
+		if activity.TextFormat == Markdown {
+			activity.Text = strings.Replace(activity.Text, "**", "*", -1)
+		}
+	}
+
+	return activity
 }

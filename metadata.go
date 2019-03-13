@@ -1,4 +1,4 @@
-package msbot
+package bots
 
 import (
 	"crypto/rsa"
@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nickalie/msbot/utils"
+	"github.com/nickalie/bots/utils"
 	"github.com/parnurzeal/gorequest"
 	"gopkg.in/square/go-jose.v2"
 )
